@@ -358,7 +358,7 @@
     <!-- LOG -->
     <section class="pane" id="pane-log">
       <div class="card">
-        <h2>Log a match</h2>
+        <h2 id="logFormTitle">Log a match</h2>
         <div class="log-row"><span class="team-dot a"></span>
           <select class="sel" id="logA1"></select><select class="sel" id="logA2"></select>
           <input type="number" class="score-input" id="logSA" min="0" placeholder="0">
@@ -367,7 +367,10 @@
           <select class="sel" id="logB1"></select><select class="sel" id="logB2"></select>
           <input type="number" class="score-input" id="logSB" min="0" placeholder="0">
         </div>
-        <button class="primary" id="logAddBtn" style="margin-top:4px;">Save match</button>
+        <div class="btn-row" style="margin-top:4px;">
+          <button class="primary" id="logAddBtn">Save match</button>
+          <button class="secondary small" id="logCancelEditBtn" style="display:none;">Cancel</button>
+        </div>
         <p class="hint" id="logMsg">Leave the second player on "–" for a 1v1. Every match counts, even outside the tournaments.</p>
       </div>
 
@@ -379,12 +382,9 @@
       </div>
 
       <div class="card">
-        <div class="card-head">
-          <h2>Match Log</h2>
-          <button class="secondary small" id="clearLogBtn">Clear log</button>
-        </div>
+        <h2>Match Log</h2>
         <div id="logList"></div>
-        <p class="hint tight">Clearing the log removes this match history. Ratings already applied from it are not affected.</p>
+        <p class="hint tight">Matches can't be deleted, only corrected with the pencil icon — so the history stays reliable and no result can quietly disappear.</p>
       </div>
     </section>
   </main>
@@ -394,11 +394,9 @@
 
 <script>
 /* =======================================================================
-   PASTE YOUR OWN FIREBASE CONFIG HERE — see the setup guide.
-   Project settings -> General -> "Your apps" -> Web app -> SDK setup and
-   configuration -> "Config". It is safe for this to be visible in the
-   page's source; real access control lives in your Firestore Rules, not
-   in hiding these values.
+   Firebase config for this group's project (kicker-app-85a4e). Safe to be
+   visible here; real access control lives in the Firestore Rules, not in
+   hiding these values.
 ======================================================================= */
 const firebaseConfig = {
   apiKey: "AIzaSyAzBYnLDY7pniWYydsY3pxc6IoKc-T3hbg",
@@ -579,23 +577,49 @@ function effectiveScore(id){
 const RATING_SCALE = 4, RATING_K = 0.8; // tuned to the 1-10 scale instead of the classic 400/24 Elo values
 function clampRating(v){ return Math.max(1, Math.min(10, v)); }
 
+// Applies a result and returns exactly how much each player's score moved
+// (after clamping), so a later correction can undo precisely that amount
+// rather than guessing.
 function applyRatingUpdate(idsA, idsB, sa, sb){
-  if(!idsA || !idsB || !idsA.length || !idsB.length) return;
+  if(!idsA || !idsB || !idsA.length || !idsB.length) return {};
   const avg = ids => ids.reduce((s,id)=>s+(playerById(id)?.score ?? 5),0)/ids.length;
   const ra = avg(idsA), rb = avg(idsB);
   const ea = 1/(1+Math.pow(10,(rb-ra)/RATING_SCALE));
   const aw = sa>sb ? 1 : 0;
-  idsA.forEach(id=>{ const p=playerById(id); if(p) p.score = clampRating(p.score + RATING_K*(aw-ea)); });
-  idsB.forEach(id=>{ const p=playerById(id); if(p) p.score = clampRating(p.score + RATING_K*((1-aw)-(1-ea))); });
+  const deltas = {};
+  idsA.forEach(id=>{
+    const p=playerById(id); if(!p) return;
+    const before=p.score; p.score = clampRating(p.score + RATING_K*(aw-ea));
+    deltas[id] = p.score - before;
+  });
+  idsB.forEach(id=>{
+    const p=playerById(id); if(!p) return;
+    const before=p.score; p.score = clampRating(p.score + RATING_K*((1-aw)-(1-ea)));
+    deltas[id] = p.score - before;
+  });
+  return deltas;
 }
 
-// Applies a result's rating effect exactly once: subsequent edits to an
-// already-rated result update the displayed score but don't re-adjust ratings.
-function rateOnce(res, idsA, idsB){
-  if(!res || res.rated) return;
+function undoRatingDeltas(deltas){
+  if(!deltas) return;
+  Object.entries(deltas).forEach(([id,d])=>{
+    const p=playerById(id); if(p) p.score = clampRating(p.score - d);
+  });
+}
+
+// Applies (or re-applies, after a correction) a result's rating effect.
+// Safe to call on every edit: it first undoes whatever this exact result
+// previously contributed (via its stored deltas), then applies the current
+// score fresh — so fixing a typo adjusts ratings correctly instead of
+// either double-counting it or freezing the mistake in place.
+function applyResult(res, idsA, idsB){
+  if(!res) return;
+  undoRatingDeltas(res.deltas);
+  res.deltas = null;
+  res.rated = false;
   const win = computeWinner(res);
   if(!win) return;
-  applyRatingUpdate(idsA, idsB, parseInt(res.home,10), parseInt(res.away,10));
+  res.deltas = applyRatingUpdate(idsA, idsB, parseInt(res.home,10), parseInt(res.away,10));
   res.rated = true;
 }
 
@@ -836,7 +860,7 @@ function onGroupScoreChange(e){
   state.team.results[gameId][side] = val;
   const g = state.team.schedule.find(x=>x.id===gameId);
   if(g){
-    rateOnce(state.team.results[gameId], teamPlayIds(teamById(g.home),g), teamPlayIds(teamById(g.away),g));
+    applyResult(state.team.results[gameId], teamPlayIds(teamById(g.home),g), teamPlayIds(teamById(g.away),g));
   }
   saveState();
 }
@@ -1006,7 +1030,7 @@ function onBracketScoreChange(e){
   match.result[side] = e.target.value;
   const homeTeam = teamById(match.home), awayTeam = teamById(match.away);
   if(homeTeam && awayTeam && !homeTeam.rotating && !awayTeam.rotating){
-    rateOnce(match.result, homeTeam.members, awayTeam.members);
+    applyResult(match.result, homeTeam.members, awayTeam.members);
   }
   saveState();
 }
@@ -1137,7 +1161,7 @@ function onRotationScoreChange(e){
   const side = e.target.dataset.side;
   const round = state.rotation.rounds.find(r=>r.id===roundId);
   round.result[side] = e.target.value;
-  rateOnce(round.result, round.pairs[0], round.pairs[1]);
+  applyResult(round.result, round.pairs[0], round.pairs[1]);
   saveState();
 }
 
@@ -1300,9 +1324,28 @@ function renderLog(){
       <span class="date">${fmtDate(m.ts)}</span>
       <span class="who"><span class="${aWin?'w':'l'}">${nm(m.a)}</span><br><span class="${aWin?'l':'w'}">${nm(m.b)}</span></span>
       <span class="res">${m.sa}:${m.sb}</span>
-      <button class="icon-btn" data-del="${m.id}" aria-label="Delete">×</button>
+      <button class="icon-btn" data-edit="${m.id}" aria-label="Edit">✎</button>
     </div>`;
   }).join("");
+}
+
+// null while adding a new match; set to a match id while correcting an
+// existing one (populated via the pencil icon on that row).
+let editingLogMatchId = null;
+
+function setLogFormMode(editing){
+  document.getElementById("logFormTitle").textContent = editing ? "Edit match" : "Log a match";
+  document.getElementById("logAddBtn").textContent = editing ? "Update match" : "Save match";
+  document.getElementById("logCancelEditBtn").style.display = editing ? "" : "none";
+}
+
+function resetLogForm(){
+  editingLogMatchId = null;
+  setLogFormMode(false);
+  ["logA1","logA2","logB1","logB2"].forEach(id=>document.getElementById(id).value="");
+  ["logSA","logSB"].forEach(id=>document.getElementById(id).value="");
+  document.getElementById("logMsg").textContent = "Leave the second player on \"–\" for a 1v1. Every match counts, even outside the tournaments.";
+  document.getElementById("logMsg").style.color = "";
 }
 
 document.getElementById("logAddBtn").addEventListener("click",()=>{
@@ -1318,41 +1361,48 @@ document.getElementById("logAddBtn").addEventListener("click",()=>{
   else if(isNaN(sa)||isNaN(sb)||sa<0||sb<0) err="Please enter both scores.";
   else if(sa===sb) err="Draws don't count, please enter a result with a winner.";
   if(err){ msg.textContent=err; msg.style.color="var(--danger)"; return; }
-  msg.textContent="Saved."; msg.style.color="";
-  applyRatingUpdate(a, b, sa, sb);
-  state.log.matches.push({id:uid("m"),ts:Date.now(),a,b,sa,sb,rated:true});
-  ["logSA","logSB"].forEach(id=>document.getElementById(id).value="");
-  saveState();
-});
 
-function clearLogAction(){
-  state.log.matches = [];
-  saveState();
-}
-makeConfirmable(document.getElementById("clearLogBtn"), clearLogAction, {
-  confirmLabel: "Tap to confirm",
-  shouldConfirm: ()=> state.log.matches.length>0,
-});
-
-// Per-row delete: rows are rebuilt on every render, so this can't use
-// makeConfirmable (which needs a stable element). Tapping once arms that
-// row's × for a few seconds; tapping the same one again deletes it.
-let pendingLogDelete = null, pendingLogDeleteTimer = null;
-document.getElementById("logList").addEventListener("click",(e)=>{
-  const t=e.target.closest("[data-del]"); if(!t) return;
-  const id = t.dataset.del;
-  if(pendingLogDelete === id){
-    clearTimeout(pendingLogDeleteTimer);
-    pendingLogDelete = null;
-    state.log.matches = state.log.matches.filter(m=>m.id!==id);
-    saveState();
-    return;
+  let confirmation;
+  if(editingLogMatchId){
+    const m = state.log.matches.find(x=>x.id===editingLogMatchId);
+    if(m){
+      undoRatingDeltas(m.deltas); // remove exactly what the old version of this match applied
+      m.a=a; m.b=b; m.sa=sa; m.sb=sb;
+      m.deltas = applyRatingUpdate(a, b, sa, sb); // re-apply fresh, on top of the corrected baseline
+      m.rated = true;
+    }
+    confirmation = "Updated.";
+  } else {
+    const deltas = applyRatingUpdate(a, b, sa, sb);
+    state.log.matches.push({id:uid("m"),ts:Date.now(),a,b,sa,sb,rated:true,deltas});
+    confirmation = "Saved.";
   }
-  pendingLogDelete = id;
-  t.textContent = "✓";
-  t.style.color = "var(--danger)";
-  clearTimeout(pendingLogDeleteTimer);
-  pendingLogDeleteTimer = setTimeout(()=>{ pendingLogDelete=null; }, 4000);
+  resetLogForm();
+  msg.textContent = confirmation; // resetLogForm() just overwrote this with the generic hint; show the real result instead
+  msg.style.color = "";
+  saveState();
+});
+
+document.getElementById("logCancelEditBtn").addEventListener("click", resetLogForm);
+
+// Matches can only be corrected (pencil icon), never deleted — so a result
+// can't just be made to disappear.
+document.getElementById("logList").addEventListener("click",(e)=>{
+  const editBtn = e.target.closest("[data-edit]");
+  if(!editBtn) return;
+  const m = state.log.matches.find(x=>x.id===editBtn.dataset.edit);
+  if(!m) return;
+  editingLogMatchId = m.id;
+  setLogFormMode(true);
+  document.getElementById("logA1").value = m.a[0] || "";
+  document.getElementById("logA2").value = m.a[1] || "";
+  document.getElementById("logB1").value = m.b[0] || "";
+  document.getElementById("logB2").value = m.b[1] || "";
+  document.getElementById("logSA").value = m.sa;
+  document.getElementById("logSB").value = m.sb;
+  const msg = document.getElementById("logMsg");
+  msg.textContent = "Editing this match — change players or score, then Update.";
+  msg.style.color = "";
 });
 
 document.getElementById("logIncludeT").addEventListener("change",(e)=>{
