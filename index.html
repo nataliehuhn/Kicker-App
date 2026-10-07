@@ -371,14 +371,14 @@
           <button class="primary" id="logAddBtn">Save match</button>
           <button class="secondary small" id="logCancelEditBtn" style="display:none;">Cancel</button>
         </div>
-        <p class="hint" id="logMsg">Leave the second player on "–" for a 1v1. Every match counts, even outside the tournaments.</p>
+        <p class="hint" id="logMsg">Leave a second player on "–" for a 1v1 or a 2v1. Every match counts, even outside the tournaments.</p>
       </div>
 
       <div class="card">
         <h2>Current standings</h2>
         <table class="standings" id="logTable"></table>
         <label class="check-row"><input type="checkbox" id="logIncludeT"> <span>Include tournament matches (Teams and Rotation modes)</span></label>
-        <p class="hint">Rating is each player's live, permanent score, the same number shown on the Players tab. It updates the moment a match is entered anywhere in the app (from 1 to 10, weighted by opponent strength — for 2v2, the team average is used) and stays put even if the match is later cleared or reset. Played, wins and goal difference below only reflect matches still on record; use the toggle to include or exclude tournament matches (Teams and Rotation modes) from that count. Knockout matches involving the 3-player rotating team don't affect ratings, since it isn't clear who actually played.</p>
+        <p class="hint">Rating is each player's live, permanent score, the same number shown on the Players tab. It updates the moment a match is entered anywhere in the app (from 1 to 10). A win against stronger opponents counts for more than one against weaker opponents, and close games move the rating much less than clear ones (a 10:9 counts for about a third of a 10:3). For 2v2 the team average is used; in a 2v1 the pair starts with a built-in head start, so the single player isn't marked down for an expected loss. The rating stays put even if the match is later cleared or reset. Played, wins and goal difference below only reflect matches still on record; use the toggle to include or exclude tournament matches (Teams and Rotation modes) from that count. Knockout matches involving the 3-player rotating team don't affect ratings, since it isn't clear who actually played.</p>
       </div>
 
       <div class="card">
@@ -577,24 +577,43 @@ function effectiveScore(id){
 const RATING_SCALE = 4, RATING_K = 0.8; // tuned to the 1-10 scale instead of the classic 400/24 Elo values
 function clampRating(v){ return Math.max(1, Math.min(10, v)); }
 
+// How much a result moves the ratings depends on how clear it was. The factor
+// runs from about 0.3 for a 10:9 to 1.5 for a 10:0 (0.85 for a 10:5), so a
+// narrow result changes little in either direction while a clear one counts
+// fully. Only the size of the change depends on it; winners never lose points
+// and losers never gain any.
+const MARGIN_BASE = 0.2, MARGIN_SLOPE = 1.3;
+function marginFactor(sa, sb){
+  const hi = Math.max(sa, sb), lo = Math.min(sa, sb);
+  if(!(hi > 0)) return 1;
+  return MARGIN_BASE + MARGIN_SLOPE * ((hi - lo) / hi);
+}
+
+// In a 2v1 the pair is expected to win more often than equal averages would
+// suggest, so it starts with this many rating points of head start. Without
+// it the single player would be punished for a loss that was to be expected.
+const TWO_VS_ONE_BONUS = 2;
+
 // Applies a result and returns exactly how much each player's score moved
 // (after clamping), so a later correction can undo precisely that amount
-// rather than guessing.
+// rather than guessing. Sides can have different sizes (2v1).
 function applyRatingUpdate(idsA, idsB, sa, sb){
   if(!idsA || !idsB || !idsA.length || !idsB.length) return {};
   const avg = ids => ids.reduce((s,id)=>s+(playerById(id)?.score ?? 5),0)/ids.length;
-  const ra = avg(idsA), rb = avg(idsB);
+  const ra = avg(idsA) + (idsA.length > idsB.length ? TWO_VS_ONE_BONUS : 0);
+  const rb = avg(idsB) + (idsB.length > idsA.length ? TWO_VS_ONE_BONUS : 0);
   const ea = 1/(1+Math.pow(10,(rb-ra)/RATING_SCALE));
   const aw = sa>sb ? 1 : 0;
+  const k = RATING_K * marginFactor(sa, sb);
   const deltas = {};
   idsA.forEach(id=>{
     const p=playerById(id); if(!p) return;
-    const before=p.score; p.score = clampRating(p.score + RATING_K*(aw-ea));
+    const before=p.score; p.score = clampRating(p.score + k*(aw-ea));
     deltas[id] = p.score - before;
   });
   idsB.forEach(id=>{
     const p=playerById(id); if(!p) return;
-    const before=p.score; p.score = clampRating(p.score + RATING_K*((1-aw)-(1-ea)));
+    const before=p.score; p.score = clampRating(p.score + k*((1-aw)-(1-ea)));
     deltas[id] = p.score - before;
   });
   return deltas;
@@ -1344,7 +1363,7 @@ function resetLogForm(){
   setLogFormMode(false);
   ["logA1","logA2","logB1","logB2"].forEach(id=>document.getElementById(id).value="");
   ["logSA","logSB"].forEach(id=>document.getElementById(id).value="");
-  document.getElementById("logMsg").textContent = "Leave the second player on \"–\" for a 1v1. Every match counts, even outside the tournaments.";
+  document.getElementById("logMsg").textContent = "Leave a second player on \"–\" for a 1v1 or a 2v1. Every match counts, even outside the tournaments.";
   document.getElementById("logMsg").style.color = "";
 }
 
@@ -1356,7 +1375,6 @@ document.getElementById("logAddBtn").addEventListener("click",()=>{
   const sa=parseInt(v("logSA"),10), sb=parseInt(v("logSB"),10);
   let err=null;
   if(!a.length||!b.length) err="Please choose at least one player on each side.";
-  else if(a.length!==b.length) err="Both sides need the same number of players (1v1 or 2v2).";
   else if(new Set([...a,...b]).size!==a.length+b.length) err="Each person can only appear once.";
   else if(isNaN(sa)||isNaN(sb)||sa<0||sb<0) err="Please enter both scores.";
   else if(sa===sb) err="Draws don't count, please enter a result with a winner.";
@@ -1473,69 +1491,147 @@ function migrateScoresFromReplay(){
   });
 }
 
-async function init(){
-  render();
-  setSync(false);
-  const configReady = !Object.values(firebaseConfig).some(v => String(v).startsWith("YOUR_"));
-  if(!configReady){
-    document.getElementById("configBanner").style.display = "block";
-    setSync(false, "not configured");
-    return;
-  }
-  try{
-    // Loaded dynamically (not as a static top-level import) so that a network
-    // hiccup, an ad/script blocker, or opening this file straight from disk
-    // without hosting it only disables sync — the rest of the app, already
-    // rendered above, keeps working in local-only mode via the catch below.
+// ---------------------------------------------------------------------
+// Firebase connection
+//
+// The whole app state is stored as ONE JSON string inside a single Firestore
+// document (kicker/state). Firestore refuses nested arrays, and rotation
+// rounds contain pairs of pairs, so writing the state as a plain object
+// makes those saves fail. Writes are only enabled once the saved data was
+// read successfully; otherwise a failed load followed by an edit would
+// overwrite the real data with the built-in starting values.
+// ---------------------------------------------------------------------
+let fbRefs = null;
+let lastServerJson = null;
+let lastBackupDay = null;
+let listening = false;
+
+function encodeDoc(data){ return { rev: data.rev || 0, savedAt: new Date().toISOString(), json: JSON.stringify(data) }; }
+function decodeDoc(d){ return (d && typeof d.json === "string") ? JSON.parse(d.json) : d; }
+function rawJson(d){ return (d && typeof d.json === "string") ? d.json : JSON.stringify(d); }
+function showBanner(text){ const b = document.getElementById("configBanner"); b.textContent = text; b.style.display = "block"; }
+function hideBanner(){ document.getElementById("configBanner").style.display = "none"; }
+
+async function connectOnce(){
+  if(!fbRefs){
+    // Loaded dynamically so that a blocked script only disables sync instead of
+    // breaking the whole page.
     const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js");
     const { getFirestore, doc, getDoc, setDoc, onSnapshot } = await import("https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js");
-    const app = initializeApp(firebaseConfig);
-    const firestore = getFirestore(app);
-    const docRef = doc(firestore, "kicker", "main");
-    // Wrap Firestore's API in the same small {get,set,onSnapshot} shape the
-    // rest of this file already expects, so nothing below needs to change.
-    dbDoc = {
-      get: async () => {
-        const snap = await getDoc(docRef);
-        return { exists: snap.exists(), data: () => snap.data() };
+    const firestore = getFirestore(initializeApp(firebaseConfig));
+    fbRefs = { firestore, doc, getDoc, setDoc, onSnapshot };
+  }
+  const { firestore, doc, getDoc, setDoc, onSnapshot } = fbRefs;
+  const stateRef  = doc(firestore, "kicker", "state");  // current data
+  const legacyRef = doc(firestore, "kicker", "main");   // older versions of this app; only read once, to carry data over
+
+  // Once per day, the state as last seen on the server is copied to
+  // kicker/backup-YYYY-MM-DD before it gets overwritten, so a bad write
+  // costs at most a day. Never blocks or fails the real save.
+  function backupOncePerDay(jsonToKeep){
+    if(!jsonToKeep) return;
+    const day = new Date().toISOString().slice(0,10);
+    if(lastBackupDay === day) return;
+    lastBackupDay = day;
+    (async()=>{
+      try{
+        const ref = doc(firestore, "kicker", "backup-" + day);
+        const existing = await getDoc(ref);
+        if(!existing.exists()) await setDoc(ref, { day, savedAt: new Date().toISOString(), json: jsonToKeep });
+      } catch(e){ console.warn("daily backup skipped", e); lastBackupDay = null; }
+    })();
+  }
+
+  dbDoc = {
+    get: async () => {
+      const snap = await getDoc(stateRef);
+      const d = snap.exists() ? snap.data() : null;
+      if(d) lastServerJson = rawJson(d);
+      return { exists: snap.exists(), data: () => decodeDoc(d) };
+    },
+    set: async (data) => {
+      backupOncePerDay(lastServerJson);
+      await setDoc(stateRef, encodeDoc(data));
+    },
+    onSnapshot: (onNext, onError) => onSnapshot(stateRef,
+      (snap) => {
+        const d = snap.exists() ? snap.data() : null;
+        if(d) lastServerJson = rawJson(d);
+        onNext({ exists: snap.exists(), data: () => decodeDoc(d) });
       },
-      set: async (data) => { await setDoc(docRef, data); },
-      onSnapshot: (onNext, onError) => onSnapshot(docRef,
-        (snap) => onNext({ exists: snap.exists(), data: () => snap.data() }),
-        onError),
-    };
-    dbAvailable = true;
-    const snap = await dbDoc.get();
-    if(snap.exists && snap.data()){
-      state = mergeState(state, snap.data());
-      if(!state.migratedIncrementalScores){
-        migrateScoresFromReplay();
-        state.migratedIncrementalScores = true;
-        state.rev = Math.max(Date.now(), (state.rev||0)+1);
-        try { await dbDoc.set(JSON.parse(JSON.stringify(state))); } catch(e){ console.error("migration write failed", e); }
-      }
-    } else {
-      state.migratedIncrementalScores = true;
-      await dbDoc.set(JSON.parse(JSON.stringify(state)));
+      onError),
+  };
+
+  // 1) Read what is saved. If this throws, nothing is written and the caller retries.
+  let source = null;
+  const snap = await dbDoc.get();
+  if(snap.exists && snap.data()){
+    state = mergeState(state, snap.data());
+    source = "state";
+  } else {
+    const legacy = await getDoc(legacyRef);
+    if(legacy.exists() && legacy.data()){
+      state = mergeState(state, decodeDoc(legacy.data()));
+      source = "legacy";
     }
-    render();
-    setSync(true);
+  }
+  let needsWrite = (source !== "state");
+  if(source !== null && !state.migratedIncrementalScores){
+    migrateScoresFromReplay();
+    state.migratedIncrementalScores = true;
+    needsWrite = true;
+  }
+  if(source === null) state.migratedIncrementalScores = true; // fresh start, nothing to migrate
+  if(needsWrite){
+    state.rev = Math.max(Date.now(), (state.rev||0)+1);
+    await dbDoc.set(JSON.parse(JSON.stringify(state)));
+  }
+
+  // 2) Only now is it safe to let the app write.
+  dbAvailable = true;
+  hideBanner();
+  render();
+  setSync(true);
+
+  if(!listening){
+    listening = true;
     dbDoc.onSnapshot((snap)=>{
       if(!snap.exists) return;
       const incoming = snap.data() || {};
       if(pendingWrites>0) return; // a local change is still in flight, don't overwrite it
       if((incoming.rev||0) <= (state.rev||0)) { setSync(true); return; } // stale or identical snapshot
-      const next = mergeState(state, incoming);
-      state = next;
+      state = mergeState(state, incoming);
       try { render(); } catch(e){ console.error("render failed", e); }
       setSync(true);
     }, (err)=>{
       console.error("db snapshot error", err);
       setSync(false);
     });
-  } catch(e){
-    console.error("Firebase init failed", e);
-    setSync(false, "Connection failed — check the Firebase config and Firestore rules");
+  }
+}
+
+async function init(){
+  render();
+  setSync(false);
+  const configReady = !Object.values(firebaseConfig).some(v => String(v).startsWith("YOUR_"));
+  if(!configReady){
+    showBanner("Firebase isn't configured yet — open this file's source, find firebaseConfig near the top of the <script> tag, and paste in your own project's values. Until then nothing will sync or save.");
+    setSync(false, "not configured");
+    return;
+  }
+  let delay = 3000;
+  for(;;){
+    try{
+      await connectOnce();
+      return;
+    } catch(e){
+      console.error("Firebase connect failed", e);
+      const why = e && (e.code || e.message) ? String(e.code || e.message) : "unknown error";
+      showBanner("Couldn't load the saved data (" + why + "). Nothing entered right now will be saved, and it will be replaced once loading works. The page keeps retrying.");
+      setSync(false, "not connected");
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(Math.round(delay * 1.6), 30000);
+    }
   }
 }
 
